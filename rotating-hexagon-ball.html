@@ -1,0 +1,432 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<title>旋转六边形 · 弹跳小球</title>
+<style>
+  :root { color-scheme: dark; }
+  * { margin: 0; padding: 0; box-sizing: border-box; }
+  html, body { height: 100%; overflow: hidden; background: #05070d; }
+  body {
+    display: grid;
+    place-items: center;
+    background:
+      radial-gradient(ellipse at 50% 42%, #16233c 0%, #0a1120 38%, #05070d 78%);
+    font-family: ui-sans-serif, system-ui, -apple-system, "PingFang SC", "Microsoft YaHei", sans-serif;
+    cursor: pointer;
+    user-select: none;
+    -webkit-tap-highlight-color: transparent;
+  }
+  canvas { display: block; width: 100%; height: 100%; }
+  .vignette {
+    position: fixed;
+    inset: 0;
+    pointer-events: none;
+    background: radial-gradient(ellipse at 50% 50%, transparent 52%, rgba(2, 4, 10, 0.8) 100%);
+  }
+  .caption {
+    position: fixed;
+    left: 50%;
+    bottom: 22px;
+    transform: translateX(-50%);
+    font-size: 11px;
+    letter-spacing: 0.26em;
+    text-transform: uppercase;
+    color: rgba(148, 170, 205, 0.45);
+    pointer-events: none;
+    white-space: nowrap;
+  }
+</style>
+</head>
+<body>
+<canvas id="scene" role="img" aria-label="旋转的六边形内，一颗受重力影响不断弹跳碰撞的小球"></canvas>
+<div class="vignette"></div>
+<div class="caption" id="caption">点击或按空格暂停 · 重力 + 旋转碰撞</div>
+<script>
+(() => {
+  'use strict';
+
+  const canvas = document.getElementById('scene');
+  const ctx = canvas.getContext('2d');
+  const caption = document.getElementById('caption');
+
+  const CONFIG = {
+    sides: 6,
+    omega: 0.55,          // 六边形角速度（弧度/秒）
+    gravityFactor: 6.3,   // 重力加速度 = 六边形半径 × 该系数
+    restitution: 0.90,    // 碰撞恢复系数
+    frictionRate: 1.2,    // 切向摩擦衰减（每秒）
+    airDrag: 0.03,        // 空气阻力
+    maxSpeedFactor: 9,    // 速度上限 = 六边形半径 × 该系数
+    trailLength: 26,
+    step: 1 / 240         // 固定物理步长
+  };
+
+  const state = {
+    width: 0,
+    height: 0,
+    dpr: 1,
+    cx: 0,
+    cy: 0,
+    R: 0,
+    angle: Math.PI / 6,
+    paused: false,
+    ball: { x: 0, y: 0, vx: 0, vy: 0, r: 16 },
+    trail: [],
+    ripples: [],
+    lastTime: 0,
+    accumulator: 0
+  };
+
+  function hexPoints(cx, cy, R, angle) {
+    const points = [];
+    for (let i = 0; i < CONFIG.sides; i++) {
+      const a = angle + (i * Math.PI * 2) / CONFIG.sides;
+      points.push([cx + Math.cos(a) * R, cy + Math.sin(a) * R]);
+    }
+    return points;
+  }
+
+  function resize() {
+    const dpr = Math.min(window.devicePixelRatio || 1, 2);
+    const w = window.innerWidth;
+    const h = window.innerHeight;
+
+    state.width = w;
+    state.height = h;
+    state.dpr = dpr;
+
+    canvas.width = Math.round(w * dpr);
+    canvas.height = Math.round(h * dpr);
+    canvas.style.width = w + 'px';
+    canvas.style.height = h + 'px';
+    ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
+
+    state.cx = w / 2;
+    state.cy = h / 2;
+    state.R = Math.min(w, h) * 0.34;
+    state.ball.r = Math.max(9, Math.min(20, state.R * 0.06));
+
+    if (state.ball.x === 0 && state.ball.y === 0) {
+      state.ball.x = state.cx - state.R * 0.12;
+      state.ball.y = state.cy - state.R * 0.4;
+      state.ball.vx = state.R * 0.9;
+      state.ball.vy = -state.R * 0.45;
+    } else {
+      // 窗口尺寸变化后把小球收回六边形附近
+      const dx = state.ball.x - state.cx;
+      const dy = state.ball.y - state.cy;
+      const maxOffset = state.R * 0.55;
+      const d = Math.hypot(dx, dy);
+      if (d > maxOffset) {
+        state.ball.x = state.cx + (dx / d) * maxOffset;
+        state.ball.y = state.cy + (dy / d) * maxOffset;
+      }
+    }
+  }
+
+  function spawnRipple(x, y, impact) {
+    const R = state.R;
+    state.ripples.push({
+      x,
+      y,
+      r: Math.max(2, R * 0.012),
+      max: R * 0.06 + Math.min(R * 0.1, impact * 0.012),
+      alpha: 1
+    });
+    if (state.ripples.length > 18) state.ripples.shift();
+  }
+
+  function stepPhysics(dt) {
+    const b = state.ball;
+    const { cx, cy, R } = state;
+
+    state.angle += CONFIG.omega * dt;
+
+    // 重力 + 空气阻力 + 积分
+    b.vy += R * CONFIG.gravityFactor * dt;
+    const drag = Math.exp(-CONFIG.airDrag * dt);
+    b.vx *= drag;
+    b.vy *= drag;
+    b.x += b.vx * dt;
+    b.y += b.vy * dt;
+
+    const pts = hexPoints(cx, cy, R, state.angle);
+
+    // 与六条边逐一做碰撞解算（迭代两轮以处理角落的多边接触）
+    for (let pass = 0; pass < 2; pass++) {
+      for (let i = 0; i < CONFIG.sides; i++) {
+        const p1 = pts[i];
+        const p2 = pts[(i + 1) % CONFIG.sides];
+
+        let tx = p2[0] - p1[0];
+        let ty = p2[1] - p1[1];
+        const tLen = Math.hypot(tx, ty) || 1;
+        tx /= tLen;
+        ty /= tLen;
+
+        // 边的法线，并确保指向六边形内部
+        let nx = -ty;
+        let ny = tx;
+        if ((cx - p1[0]) * nx + (cy - p1[1]) * ny < 0) {
+          nx = -nx;
+          ny = -ny;
+        }
+
+        const dist = (b.x - p1[0]) * nx + (b.y - p1[1]) * ny;
+        if (dist >= b.r) continue;
+
+        const penetration = b.r - dist;
+        const contactX = b.x - dist * nx;
+        const contactY = b.y - dist * ny;
+
+        // 旋转墙面在接触点处的速度：v = ω × r
+        const wallVx = -CONFIG.omega * (contactY - cy);
+        const wallVy = CONFIG.omega * (contactX - cx);
+
+        // 先修正位置，避免穿墙
+        b.x += nx * penetration;
+        b.y += ny * penetration;
+
+        // 相对速度做弹性反射，再由墙面速度把小球“带”起来
+        let rvx = b.vx - wallVx;
+        let rvy = b.vy - wallVy;
+        const vn = rvx * nx + rvy * ny;
+
+        if (vn < 0) {
+          const impact = -vn;
+          const impulse = -(1 + CONFIG.restitution) * vn;
+          rvx += nx * impulse;
+          rvy += ny * impulse;
+
+          // 切向摩擦
+          const vnAfter = rvx * nx + rvy * ny;
+          let tvx = rvx - vnAfter * nx;
+          let tvy = rvy - vnAfter * ny;
+          const friction = Math.exp(-CONFIG.frictionRate * dt);
+          tvx *= friction;
+          tvy *= friction;
+          rvx = vnAfter * nx + tvx;
+          rvy = vnAfter * ny + tvy;
+
+          b.vx = rvx + wallVx;
+          b.vy = rvy + wallVy;
+
+          if (impact > R * 0.73) spawnRipple(contactX, contactY, impact);
+        } else {
+          b.vx = rvx + wallVx;
+          b.vy = rvy + wallVy;
+        }
+      }
+    }
+
+    // 速度上限
+    const maxSpeed = R * CONFIG.maxSpeedFactor;
+    const speed = Math.hypot(b.vx, b.vy);
+    if (speed > maxSpeed) {
+      const k = maxSpeed / speed;
+      b.vx *= k;
+      b.vy *= k;
+    }
+
+    // 兜底：任何情况下都不允许小球逃出六边形
+    const dx = b.x - cx;
+    const dy = b.y - cy;
+    const d = Math.hypot(dx, dy) || 1;
+    const limit = R - b.r * 0.5;
+    if (d > limit) {
+      b.x = cx + (dx / d) * limit;
+      b.y = cy + (dy / d) * limit;
+      const vn = (b.vx * dx + b.vy * dy) / d;
+      if (vn > 0) {
+        b.vx -= 1.6 * vn * (dx / d);
+        b.vy -= 1.6 * vn * (dy / d);
+      }
+    }
+  }
+
+  function updateVisuals(dt) {
+    const b = state.ball;
+
+    state.trail.push({ x: b.x, y: b.y });
+    while (state.trail.length > CONFIG.trailLength) state.trail.shift();
+
+    for (let i = state.ripples.length - 1; i >= 0; i--) {
+      const ripple = state.ripples[i];
+      ripple.r += dt * Math.max(40, state.R * 0.38);
+      ripple.alpha -= dt * 2.2;
+      if (ripple.alpha <= 0 || ripple.r > ripple.max) {
+        state.ripples.splice(i, 1);
+      }
+    }
+  }
+
+  function draw() {
+    const { width: w, height: h, cx, cy, R, angle, ball } = state;
+    ctx.clearRect(0, 0, w, h);
+
+    // 六边形后方的环境光
+    const ambient = ctx.createRadialGradient(cx, cy, R * 0.1, cx, cy, R * 1.45);
+    ambient.addColorStop(0, 'rgba(64, 120, 255, 0.10)');
+    ambient.addColorStop(0.55, 'rgba(88, 70, 200, 0.055)');
+    ambient.addColorStop(1, 'rgba(0, 0, 0, 0)');
+    ctx.fillStyle = ambient;
+    ctx.beginPath();
+    ctx.arc(cx, cy, R * 1.45, 0, Math.PI * 2);
+    ctx.fill();
+
+    const pts = hexPoints(cx, cy, R, angle);
+
+    // 内壁的淡淡填充
+    ctx.beginPath();
+    pts.forEach((p, i) => (i === 0 ? ctx.moveTo(p[0], p[1]) : ctx.lineTo(p[0], p[1])));
+    ctx.closePath();
+    const fill = ctx.createLinearGradient(cx - R, cy - R, cx + R, cy + R);
+    fill.addColorStop(0, 'rgba(56, 100, 170, 0.10)');
+    fill.addColorStop(0.5, 'rgba(20, 30, 60, 0.015)');
+    fill.addColorStop(1, 'rgba(110, 70, 190, 0.10)');
+    ctx.fillStyle = fill;
+    ctx.fill();
+
+    // 六边形主描边
+    const stroke = ctx.createLinearGradient(cx - R, cy - R, cx + R, cy + R);
+    stroke.addColorStop(0, '#5eead4');
+    stroke.addColorStop(0.5, '#7dd3fc');
+    stroke.addColorStop(1, '#a78bfa');
+    ctx.lineJoin = 'round';
+    ctx.lineCap = 'round';
+    ctx.lineWidth = Math.max(2, R * 0.012);
+    ctx.strokeStyle = stroke;
+    ctx.shadowColor = 'rgba(96, 165, 250, 0.9)';
+    ctx.shadowBlur = R * 0.1;
+    ctx.stroke();
+    ctx.shadowBlur = 0;
+
+    // 内部细描边，让边框更通透
+    ctx.lineWidth = 1;
+    ctx.strokeStyle = 'rgba(212, 236, 255, 0.30)';
+    ctx.stroke();
+
+    // 顶点光点
+    for (const p of pts) {
+      ctx.shadowColor = 'rgba(125, 211, 252, 0.9)';
+      ctx.shadowBlur = R * 0.045;
+      ctx.fillStyle = 'rgba(224, 246, 255, 0.9)';
+      ctx.beginPath();
+      ctx.arc(p[0], p[1], Math.max(1.6, R * 0.008), 0, Math.PI * 2);
+      ctx.fill();
+      ctx.shadowBlur = 0;
+    }
+
+    // 碰撞涟漪（裁剪在六边形内部，避免溢出到边框之外）
+    ctx.save();
+    ctx.beginPath();
+    pts.forEach((p, i) => (i === 0 ? ctx.moveTo(p[0], p[1]) : ctx.lineTo(p[0], p[1])));
+    ctx.closePath();
+    ctx.clip();
+    for (const ripple of state.ripples) {
+      ctx.strokeStyle = `rgba(125, 211, 252, ${Math.max(0, ripple.alpha) * 0.55})`;
+      ctx.lineWidth = 1.4;
+      ctx.beginPath();
+      ctx.arc(ripple.x, ripple.y, ripple.r, 0, Math.PI * 2);
+      ctx.stroke();
+    }
+    ctx.restore();
+
+    // 小球拖尾
+    ctx.save();
+    ctx.globalCompositeOperation = 'lighter';
+    const trail = state.trail;
+    for (let i = 0; i < trail.length; i++) {
+      const t = (i + 1) / trail.length;
+      const p = trail[i];
+      ctx.fillStyle = `rgba(255, 142, 58, ${t * t * 0.20})`;
+      ctx.beginPath();
+      ctx.arc(p.x, p.y, ball.r * t * 0.95, 0, Math.PI * 2);
+      ctx.fill();
+    }
+    ctx.restore();
+
+    // 小球本体
+    ctx.save();
+    ctx.shadowColor = 'rgba(255, 150, 60, 0.85)';
+    ctx.shadowBlur = ball.r * 2.4;
+    const ballGradient = ctx.createRadialGradient(
+      ball.x - ball.r * 0.34,
+      ball.y - ball.r * 0.4,
+      ball.r * 0.08,
+      ball.x,
+      ball.y,
+      ball.r * 1.05
+    );
+    ballGradient.addColorStop(0, '#fff9ea');
+    ballGradient.addColorStop(0.35, '#ffd27a');
+    ballGradient.addColorStop(0.75, '#ff9a3c');
+    ballGradient.addColorStop(1, '#ee6a1e');
+    ctx.fillStyle = ballGradient;
+    ctx.beginPath();
+    ctx.arc(ball.x, ball.y, ball.r, 0, Math.PI * 2);
+    ctx.fill();
+    ctx.shadowBlur = 0;
+
+    // 边缘与高光
+    ctx.lineWidth = 1;
+    ctx.strokeStyle = 'rgba(255, 228, 184, 0.55)';
+    ctx.stroke();
+
+    ctx.fillStyle = 'rgba(255, 255, 255, 0.78)';
+    ctx.beginPath();
+    ctx.arc(ball.x - ball.r * 0.32, ball.y - ball.r * 0.38, ball.r * 0.22, 0, Math.PI * 2);
+    ctx.fill();
+    ctx.restore();
+  }
+
+  function frame(now) {
+    if (!state.lastTime) state.lastTime = now;
+    let dt = (now - state.lastTime) / 1000;
+    state.lastTime = now;
+    if (!Number.isFinite(dt) || dt < 0) dt = 0;
+    dt = Math.min(dt, 1 / 20);
+
+    if (!state.paused) {
+      state.accumulator += dt;
+      let guard = 0;
+      while (state.accumulator >= CONFIG.step && guard < 8) {
+        stepPhysics(CONFIG.step);
+        state.accumulator -= CONFIG.step;
+        guard++;
+      }
+      if (guard === 8) state.accumulator = 0;
+      updateVisuals(dt);
+    }
+
+    draw();
+    requestAnimationFrame(frame);
+  }
+
+  function togglePause() {
+    state.paused = !state.paused;
+    caption.textContent = state.paused ? '已暂停 · 点击继续' : '点击或按空格暂停 · 重力 + 旋转碰撞';
+  }
+
+  canvas.addEventListener('pointerdown', togglePause);
+  window.addEventListener('keydown', (event) => {
+    if (event.code === 'Space') {
+      event.preventDefault();
+      togglePause();
+    }
+  });
+  window.addEventListener('resize', resize);
+  document.addEventListener('visibilitychange', () => {
+    state.lastTime = 0;
+    state.accumulator = 0;
+  });
+
+  resize();
+  draw();
+  requestAnimationFrame(frame);
+})();
+</script>
+</body>
+</html>
